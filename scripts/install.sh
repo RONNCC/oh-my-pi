@@ -15,7 +15,7 @@ set -e
 # Prebuilt binaries come from the build service (PI_BUILD_URL, default
 # https://build.stencil.so) and are checked against its sha256 before install.
 
-REPO="can1357/oh-my-pi"
+REPO="RONNCC/oh-my-pi"
 PACKAGE="@oh-my-pi/pi-coding-agent"
 INSTALL_DIR="${PI_INSTALL_DIR:-$HOME/.local/bin}"
 BUILD_URL="${PI_BUILD_URL:-https://build.stencil.so}"
