@@ -85,7 +85,7 @@ const ZSTD_MAGIC = 0xfd2fb528;
 
 const ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1";
 const ANTHROPIC_OAUTH_BETA =
-	"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11";
+	"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11";
 
 export interface ModelsDevModel {
 	id?: string;
@@ -532,6 +532,27 @@ function mapWithBundledReference<TApi extends Api>(
 }
 
 /**
+ * {@link mapWithBundledReference} plus the `input_modalities` /
+ * `max_output_length` / `supported_features` row vocabulary. Each field falls
+ * back to the reference when absent; a present feature list decides tool support.
+ */
+function mapWithFeatureListMetadata<TApi extends Api>(
+	entry: OpenAICompatibleModelRecord,
+	defaults: ModelSpec<TApi>,
+	reference: ModelSpec<TApi> | undefined,
+): ModelSpec<TApi> {
+	const model = mapWithBundledReference(entry, defaults, reference);
+	return {
+		...model,
+		input: Array.isArray(entry.input_modalities) ? toInputCapabilities(entry.input_modalities) : model.input,
+		maxTokens: toPositiveNumber(entry.max_output_length, model.maxTokens),
+		...(Array.isArray(entry.supported_features) && {
+			supportsTools: entry.supported_features.includes("tools"),
+		}),
+	};
+}
+
+/**
  * Rates from an OpenRouter-shaped `pricing` object (USD per token, as decimal
  * strings). Missing, zero, or negative legs (`-1` marks router-priced rows)
  * map to 0, which the model manager fills from its reference sources.
@@ -767,7 +788,7 @@ function isLikelyOpenAIResponsesModelId(
 }
 
 /** Regex matching NanoGPT `:thinking` suffixed model IDs (with or without a level). */
-const NANO_GPT_THINKING_SUFFIX_RE = /:thinking(:[^:]+)?$/;
+export const NANO_GPT_THINKING_SUFFIX_RE = /:thinking(:[^:]+)?$/;
 
 function isLikelyNanoGptTextModelId(id: string): boolean {
 	const normalized = id.trim().toLowerCase();
@@ -801,6 +822,10 @@ type OpenAICompatibleModelManagerBuilderOptions<TApi extends Api> = {
 	config?: SimpleProviderConfig;
 	headers?: SimpleProviderDiscoveryHeaders;
 	dynamicModelsAuthoritative?: true;
+	/** Live rows are the whole truth for reasoning (no OR-merge with the bundle). */
+	dynamicReasoningAuthoritative?: true;
+	/** Live rows are the whole truth for input modality (no OR-merge with the bundle). */
+	dynamicInputAuthoritative?: true;
 	requireApiKey?: true;
 	dropCachedModelIdsOnStaticMismatch?: readonly string[];
 	cacheProviderId?: string;
@@ -828,6 +853,8 @@ function createOpenAICompatibleModelManagerOptions<TApi extends Api>(
 		providerId: options.providerId,
 		...(options.cacheProviderId && { cacheProviderId: options.cacheProviderId }),
 		...(options.dynamicModelsAuthoritative && { dynamicModelsAuthoritative: true }),
+		...(options.dynamicReasoningAuthoritative && { dynamicReasoningAuthoritative: true }),
+		...(options.dynamicInputAuthoritative && { dynamicInputAuthoritative: true }),
 		...(options.dropCachedModelIdsOnStaticMismatch && {
 			dropCachedModelIdsOnStaticMismatch: options.dropCachedModelIdsOnStaticMismatch,
 		}),
@@ -3622,10 +3649,13 @@ export function openrouterModelManagerOptions(config?: OpenRouterModelManagerCon
 	const references = createBundledReferenceMap<"openrouter">("openrouter");
 	return {
 		providerId: "openrouter",
-		// Older builds cached OpenRouter discovery rows as `api: "openai-completions"`.
-		// Namespace the refreshed pseudo-API cache separately so those rows cannot
-		// override bundled `api: "openrouter"` models during online-if-uncached startup.
-		cacheProviderId: resolveModelCacheProviderId("openrouter"),
+		// Older builds cached OpenRouter discovery rows as `api: "openai-completions"`;
+		// the pseudo-API namespace keeps them from overriding bundled `api: "openrouter"`
+		// models. It is also scoped by key: the keyed roster is guardrail-filtered.
+		cacheProviderId: resolveModelCacheProviderId("openrouter", { apiKey, baseUrl }),
+		// With a key, `/models` lists only the models the key's workspace guardrails
+		// allow; bundled rows from the public roster must not widen that set.
+		dynamicModelsAuthoritative: true,
 		fetchDynamicModels: async () => {
 			const [chatModels, imageModels, decisionModels, rerankModels, videoModels, embeddingModels] =
 				await Promise.all([
@@ -3824,12 +3854,12 @@ export function openrouterModelManagerOptions(config?: OpenRouterModelManagerCon
 				]);
 
 			if (imageModels === null) {
-				logger.warn("OpenRouter image model discovery unavailable; preserving chat model discovery", {
+				logger.warn("OpenRouter image model discovery unavailable; preserving other model discovery", {
 					endpoint: `${baseUrl}/images/models`,
 				});
 			}
 			if (decisionModels === null) {
-				logger.warn("OpenRouter decision model discovery unavailable; preserving chat model discovery", {
+				logger.warn("OpenRouter decision model discovery unavailable; preserving other model discovery", {
 					endpoint: `${baseUrl}/models?output_modalities=decisions`,
 				});
 			}
@@ -3848,19 +3878,19 @@ export function openrouterModelManagerOptions(config?: OpenRouterModelManagerCon
 					endpoint: `${baseUrl}/embeddings/models`,
 				});
 			}
-			if (
-				chatModels === null &&
-				imageModels === null &&
-				decisionModels === null &&
-				rerankModels === null &&
-				videoModels === null &&
-				embeddingModels === null
-			) {
+			// Discovery is authoritative for chat rows: a successful result replaces
+			// the bundled chat roster. Without the chat listing there is no roster to
+			// replace it with, so fall back to cache/bundled rows instead of pruning
+			// every chat model on the strength of a media-only response.
+			if (chatModels === null) {
+				logger.warn("OpenRouter chat model discovery unavailable; keeping cached model catalog", {
+					endpoint: `${baseUrl}/models`,
+				});
 				return null;
 			}
 
 			const models = new Map<string, ModelSpec<Api>>();
-			for (const model of chatModels ?? []) models.set(model.id, model);
+			for (const model of chatModels) models.set(model.id, model);
 			for (const model of imageModels ?? []) models.set(model.id, model);
 			for (const model of decisionModels ?? []) models.set(model.id, model);
 			for (const model of rerankModels ?? []) models.set(model.id, model);
@@ -4844,6 +4874,63 @@ export function togetherModelManagerOptions(
 }
 
 // ---------------------------------------------------------------------------
+// Chutes
+// ---------------------------------------------------------------------------
+
+/**
+ * Chutes rows carry a flat `pricing` object in USD per million tokens
+ * (`prompt`, `completion`, `input_cache_read`), plus `context_length`,
+ * `max_output_length`, `input_modalities`, and `supported_features`. Each
+ * field falls back independently to the bundled row when absent, so a row
+ * missing one field keeps the rest of its live metadata.
+ */
+function mapChutesModel(
+	entry: OpenAICompatibleModelRecord,
+	defaults: ModelSpec<"openai-completions">,
+	reference: ModelSpec<"openai-completions"> | undefined,
+): ModelSpec<"openai-completions"> {
+	const model = mapWithFeatureListMetadata(entry, defaults, reference);
+	const reasoning = Array.isArray(entry.supported_features)
+		? entry.supported_features.includes("reasoning")
+		: model.reasoning;
+	const pricing = isRecord(entry.pricing) ? entry.pricing : {};
+	return {
+		...model,
+		reasoning,
+		// A row that reports no reasoning must not carry a reference effort ladder.
+		...(reasoning ? {} : { thinking: undefined }),
+		// Chutes reports a nonzero price for every priced chute; an absent
+		// price falls back to the bundled row, so cost is not authoritative.
+		cost: {
+			input: toPositiveNumber(pricing.prompt, model.cost.input),
+			output: toPositiveNumber(pricing.completion, model.cost.output),
+			cacheRead: toPositiveNumber(pricing.input_cache_read, model.cost.cacheRead),
+			cacheWrite: model.cost.cacheWrite,
+		},
+	};
+}
+
+/** Builds Chutes' model-discovery manager (`https://llm.chutes.ai/v1/models`). */
+export function chutesModelManagerOptions(config?: SimpleProviderConfig): ModelManagerOptions<"openai-completions"> {
+	return createOpenAICompatibleModelManagerOptions({
+		api: "openai-completions",
+		providerId: "chutes",
+		defaultBaseUrl: "https://llm.chutes.ai/v1",
+		config,
+		requireApiKey: true,
+		// Must live on the manager options, not only the KDL descriptor:
+		// `createModelManager()` prunes the bundled slice from this flag.
+		dynamicModelsAuthoritative: true,
+		// `supported_features` / `input_modalities` are the deployment's whole
+		// truth: a live row without `reasoning` or `image` must not regain them
+		// from the bundled row.
+		dynamicReasoningAuthoritative: true,
+		dynamicInputAuthoritative: true,
+		mapModel: mapChutesModel,
+	});
+}
+
+// ---------------------------------------------------------------------------
 // Inception
 // ---------------------------------------------------------------------------
 
@@ -4868,16 +4955,10 @@ export function inceptionModelManagerOptions(config?: ModelManagerConfig): Model
 				if (!Array.isArray(entry.supported_endpoints) || !entry.supported_endpoints.includes("chat.completions")) {
 					return null;
 				}
-				const model = mapWithBundledReference(entry, defaults, reference);
+				const model = mapWithFeatureListMetadata(entry, defaults, reference);
 				return {
 					...model,
-					input: Array.isArray(entry.input_modalities) ? toInputCapabilities(entry.input_modalities) : model.input,
 					cost: isRecord(entry.pricing) ? perTokenPricingCost(entry.pricing) : model.cost,
-					contextWindow: toPositiveNumber(entry.context_length, model.contextWindow),
-					maxTokens: toPositiveNumber(entry.max_output_length, model.maxTokens),
-					...(Array.isArray(entry.supported_features) && {
-						supportsTools: entry.supported_features.includes("tools"),
-					}),
 				};
 			},
 		}),
@@ -6347,13 +6428,15 @@ async function fetchLiteLLMRichEndpoint<TApi extends Api>(
 
 async function fetchLiteLLMRichModelsInternal<TApi extends Api>(
 	options: FetchLiteLLMRichModelsOptions<TApi>,
-): Promise<ModelSpec<TApi>[] | null> {
+): Promise<{ models: ModelSpec<TApi>[]; excludedModelIds: ReadonlySet<string> } | null> {
 	const managementBaseUrl = normalizeLiteLLMManagementBaseUrl(options.baseUrl);
 	const runtimeBaseUrl = normalizeLiteLLMRuntimeBaseUrl(options.baseUrl);
 	if (!managementBaseUrl || !runtimeBaseUrl) {
 		return null;
 	}
-	const fetchModels = async (signal?: AbortSignal): Promise<ModelSpec<TApi>[] | null> => {
+	const fetchModels = async (
+		signal?: AbortSignal,
+	): Promise<{ models: ModelSpec<TApi>[]; excludedModelIds: ReadonlySet<string> } | null> => {
 		const deduped = new Map<string, LiteLLMRichEndpointModel<TApi>>();
 		const excludedModelIds = new Set<string>();
 		let metadataFailure: LiteLLMRichEndpointFailure | undefined;
@@ -6419,16 +6502,19 @@ async function fetchLiteLLMRichModelsInternal<TApi extends Api>(
 		}
 		if (deduped.size === 0) {
 			if (excludedModelIds.size > 0) {
-				return [];
+				return { models: [], excludedModelIds };
 			}
 			if (metadataFailure) {
 				warnLiteLLMMetadataFallback(managementBaseUrl, metadataFailure);
 			}
 			return null;
 		}
-		return Array.from(deduped.values())
-			.map(entry => entry.model)
-			.sort((left, right) => left.id.localeCompare(right.id));
+		return {
+			models: Array.from(deduped.values())
+				.map(entry => entry.model)
+				.sort((left, right) => left.id.localeCompare(right.id)),
+			excludedModelIds,
+		};
 	};
 	if (options.signal !== undefined) {
 		return fetchModels(options.signal);
@@ -6441,7 +6527,7 @@ async function fetchLiteLLMRichModelsInternal<TApi extends Api>(
 export async function fetchLiteLLMRichModels<TApi extends Api>(
 	options: FetchLiteLLMRichModelsOptions<TApi>,
 ): Promise<ModelSpec<TApi>[] | null> {
-	return fetchLiteLLMRichModelsInternal(options);
+	return (await fetchLiteLLMRichModelsInternal(options))?.models ?? null;
 }
 
 export function litellmModelManagerOptions(config?: LiteLLMModelManagerConfig): ModelManagerOptions<Api> {
@@ -6449,30 +6535,30 @@ export function litellmModelManagerOptions(config?: LiteLLMModelManagerConfig): 
 	const baseUrl = config?.baseUrl ?? getDefaultModelDiscoveryBaseUrl("litellm")!;
 	return {
 		providerId: "litellm",
-		// rich-v14 fetches all /v2/model/info pages so cached proxy rosters
-		// include models beyond page one. rich-v13 routes `mode: decisions`
-		// groups to the Decisions runner as judge rows.
-		// rich-v12 invalidates namespaced proxy ids that missed bare catalog
-		// references. rich-v11 excluded ClinePass gateway metadata (issue #10932).
-		// rich-v10 filtered known non-conversational LiteLLM modes, keyed the
-		// deployment's `supports_vision` declaration into cached compat, and
-		// unioned compat across management endpoints instead of letting a later
-		// endpoint retract what an earlier one reported (issue #11982). Earlier
-		// versions fixed provider-specific transport leakage, added bundled
-		// reference fallback, moved OpenAI models to Responses, continued past
-		// incomplete vision/API metadata and endpoints omitting cache pricing,
-		// stripped reseller usage suffixes, filtered placeholder rows, and mapped
-		// rich pricing. Bump the version whenever these mappers change, or warm
-		// authoritative caches keep serving pre-change rows for the full TTL.
-		cacheProviderId: resolveModelCacheProviderId("litellm", { baseUrl }),
-		// litellm is a local-only proxy and is never bundled in models.json (that
-		// would leak the machine's localhost catalog). Prefer the proxy's richer
-		// management metadata, then enrich ids against models.dev with the bundled
-		// catalog as a fallback before using /v1/models.
+		dynamicModelsAuthoritative: true,
+		// Cache namespaces include the credential: virtual keys on one proxy
+		// can see different model rosters.
+		cacheProviderId: resolveModelCacheProviderId("litellm", { apiKey, baseUrl }),
+		// LiteLLM's authenticated /v1/models is the selectable roster; management
+		// endpoints only supply metadata for those exact ids.
 		fetchDynamicModels: async () => {
 			const modelsDevReferences = await loadModelsDevReferences<Api>(config?.fetch);
 			const resolveReference = createReferenceResolver(modelsDevReferences);
-			const richModels = await fetchLiteLLMRichModels<Api>({
+			const scopedModels = await fetchOpenAICompatibleModels<Api>({
+				api: "openai-completions",
+				provider: "litellm",
+				baseUrl,
+				apiKey,
+				mapModel: (entry, defaults) =>
+					mapLiteLLMOpenAICompatibleModel(entry, defaults, resolveReference(defaults.id)),
+				fetch: config?.fetch,
+			});
+			if (scopedModels === null) {
+				logger.warn("LiteLLM /v1/models unavailable; cannot determine the authorized model roster", { baseUrl });
+				return null;
+			}
+			if (scopedModels.length === 0) return [];
+			const rich = await fetchLiteLLMRichModelsInternal<Api>({
 				api: "openai-completions",
 				provider: "litellm",
 				baseUrl,
@@ -6482,20 +6568,12 @@ export function litellmModelManagerOptions(config?: LiteLLMModelManagerConfig): 
 				resolveApi: resolveLiteLLMApi,
 				timeoutMs: 10_000,
 			});
-			const models =
-				richModels ??
-				(await fetchOpenAICompatibleModels<Api>({
-					api: "openai-completions",
-					provider: "litellm",
-					baseUrl,
-					apiKey,
-					mapModel: (entry, defaults) =>
-						mapLiteLLMOpenAICompatibleModel(entry, defaults, resolveReference(defaults.id)),
-					fetch: config?.fetch,
-				}));
+			const richById = new Map(rich?.models.map(model => [model.id, model]));
+			const models = scopedModels
+				.filter(model => !rich?.excludedModelIds.has(model.id))
+				.map(model => richById.get(model.id) ?? model);
 			// Bare catalog names can label proxy namespaces, but their pricing,
 			// limits and request routing must never enrich a different deployment.
-			if (models === null) return null;
 			return models.map(model => {
 				const name = toLiteLLMDisplayName(model.name, resolveReference(bareModelId(model.id))?.name, model.id);
 				return name === model.name ? model : { ...model, name };
@@ -7427,8 +7505,19 @@ const GOOGLE_VERTEX_OPENAI_BASE_URL =
 	"https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/endpoints/openapi";
 const GOOGLE_VERTEX_ANTHROPIC_BASE_URL =
 	"https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/anthropic/models/{model}:streamRawPredict";
+const GOOGLE_VERTEX_MISTRAL_BASE_URL =
+	"https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/mistralai/models/{model}:streamRawPredict";
 
 function resolveGoogleVertexApi(modelId: string, raw: ModelsDevModel): { api: Api; baseUrl: string } {
+	// Vertex hosts partner models on publisher-scoped raw-predict endpoints;
+	// the Mistral publisher serves the OpenAI chat-completions wire shape
+	// (unlike the Anthropic publisher's Messages shape below).
+	if (raw.provider?.npm === "@ai-sdk/mistral") {
+		return {
+			api: "openai-completions",
+			baseUrl: GOOGLE_VERTEX_MISTRAL_BASE_URL.replace("{model}", modelId),
+		};
+	}
 	if (raw.provider?.npm === "@ai-sdk/google-vertex/anthropic") {
 		return {
 			api: "anthropic-messages",
